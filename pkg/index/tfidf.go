@@ -1,6 +1,7 @@
 package index
 
 import (
+	"io"
 	"math"
 	"os"
 	"sort"
@@ -12,17 +13,12 @@ type DocId int64
 // IdMap is a map from DocId → the document. It lets us look up document file paths.
 type IdMap map[DocId]DocumentPath
 
-// TermCounts is a map from Term → DocId → number of times the Term occurred in the doc.
-type TermCounts map[Term]map[DocId]int64
+type TermFreqs map[Term]float64
 
-// DocLengths stores the total number of terms in each document.
-type DocLengths map[DocId]int64
-
-// Stats are the statistics for the Corpus that are used to build the tfidf index.
-type Stats struct {
-	LookupDoc  IdMap
-	DocLengths DocLengths
-	TermCounts TermCounts
+// CorpusStats are the statistics for the Corpus that are used to build the tfidf index.
+type CorpusStats struct {
+	LookupDoc       IdMap
+	LookupTermFreqs map[DocId]TermFreqs
 }
 
 // Score is a particular Term's tfidf value for a given document.
@@ -31,95 +27,135 @@ type Score struct {
 	Score float64
 }
 
-// Scores in a list of Scores across all documents for a given Term.
-type Scores []Score
-
-func (s Scores) Len() int {
-	return len(s)
-}
-
-func (s Scores) Less(i, j int) bool {
-	return s[i].Score < s[j].Score
-}
-
-func (s Scores) Swap(i, j int) {
-	s[j], s[i] = s[i], s[j]
-}
-
 // Index is the set of Scores for all Terms across all documents.
-type Index map[Term]Scores
+type Index struct {
+	LookupDoc IdMap
+	Scores    map[Term][]Score
+}
 
-// BuildStats creates the document statistics for a Corpus that are used to build the tfidf Index.
-func BuildStats(corpus Corpus) (Stats, error) {
-	ids := 0
+// BuildTermFreqMap creates a map of Term frequencies for the given input.
+func BuildTermFreqMap(r io.Reader) TermFreqs {
+	hist := TermFreqs{}
+	numTerms := 0
+	for _, term := range Terms(r) {
+		hist[term] += 1
+		numTerms += 1
+	}
+	freq := TermFreqs{}
+	for t, c := range hist {
+		freq[t] = float64(c) / float64(numTerms)
+	}
+	return freq
+}
 
+// BuildCorpusStats creates the document statistics for a Corpus that are used to build the tfidf Index.
+func BuildCorpusStats(corpus Corpus) (CorpusStats, error) {
+	ids := int64(0)
 	idMap := IdMap{}
-	docLengths := DocLengths{}
-	termCounts := TermCounts{}
 
+	docStats := map[DocId]TermFreqs{}
 	for _, doc := range corpus {
 		f, err := os.Open(string(doc))
 		if err != nil {
-			return Stats{}, err
+			return CorpusStats{}, err
 		}
 		defer f.Close()
 
 		id := DocId(ids)
-		totalTerms := int64(0)
+		docStats[id] = BuildTermFreqMap(f)
 
-		for _, term := range Terms(f) {
-			var counts map[DocId]int64
-			if f, ok := termCounts[term]; ok {
-				counts = f
-			} else {
-				counts = map[DocId]int64{}
-				termCounts[term] = counts
-			}
-
-			if _, ok := counts[id]; ok {
-				counts[id] += 1
-			} else {
-				counts[id] = 1
-			}
-
-			totalTerms += 1
-		}
-
-		if err != nil {
-			return Stats{}, err
-		}
-
-		docLengths[id] = totalTerms
 		idMap[id] = doc
 		ids += 1
 	}
 
-	return Stats{
-		LookupDoc:  idMap,
-		DocLengths: docLengths,
-		TermCounts: termCounts,
+	return CorpusStats{
+		LookupDoc:       idMap,
+		LookupTermFreqs: docStats,
 	}, nil
 }
 
 // BuildIndex creates a tfidf based Index from the Stats of a Corpus.
-func BuildIndex(stats Stats) Index {
-	index := Index{}
+func BuildIndex(corpus CorpusStats) Index {
+	lookupTermFreqs := corpus.LookupTermFreqs
+	docsWithTerm := map[Term]float64{}
+	for _, freqs := range lookupTermFreqs {
+		for term := range freqs {
+			docsWithTerm[term] += 1.0
+		}
+	}
 
-	numDocs := float64(len(stats.LookupDoc))
-	for term, entries := range stats.TermCounts {
-		var scores Scores
-		numDocsWithTerm := float64(len(entries))
-		idf := math.Log(numDocs / numDocsWithTerm)
-		for docId, freq := range entries {
-			tf := float64(freq) / float64(stats.DocLengths[docId])
-			scores = append(scores, Score{
+	idx := Index{
+		LookupDoc: corpus.LookupDoc,
+		Scores:    map[Term][]Score{},
+	}
+	numDocs := float64(len(lookupTermFreqs))
+	for docId, termFreqs := range lookupTermFreqs {
+		for term, tf := range termFreqs {
+			numDocsWithTerm := docsWithTerm[term]
+			idf := math.Log(numDocs/(1+numDocsWithTerm)) + 1
+			if _, ok := idx.Scores[term]; !ok {
+				idx.Scores[term] = []Score{}
+			}
+			idx.Scores[term] = append(idx.Scores[term], Score{
 				DocId: docId,
 				Score: tf * idf,
 			})
 		}
-		sort.Sort(sort.Reverse(scores))
-		index[term] = scores
 	}
 
-	return index
+	return idx
+}
+
+type QueryResult struct {
+	Document DocumentPath
+	Score    float64
+}
+
+type QueryResults []QueryResult
+
+func (r QueryResults) Len() int {
+	return len(r)
+}
+
+func (r QueryResults) Less(i, j int) bool {
+	return r[i].Score < r[j].Score
+}
+
+func (r QueryResults) Swap(i, j int) {
+	r[i], r[j] = r[j], r[i]
+}
+
+// Query determines matches using cosine similarity. Its input is also an Index since user queries are
+// tokenized and scored the same way as documents so they can be compared.
+// See: https://en.wikipedia.org/wiki/Cosine_similarity
+func (idx Index) Query(qry Index) []QueryResult {
+	var res QueryResults
+
+	numers := map[DocId]float64{}
+	b_d := map[DocId]float64{}
+	a_d := float64(0.0)
+	for at, a_scores := range qry.Scores {
+		// there's only one "document" in the query
+		ascore := a_scores[0]
+		a_d += ascore.Score * ascore.Score
+
+		if b_scores, found := idx.Scores[at]; found {
+			for _, bscore := range b_scores {
+				numers[bscore.DocId] += ascore.Score * bscore.Score
+				b_d[bscore.DocId] += bscore.Score * bscore.Score
+			}
+		}
+	}
+
+	ad := math.Sqrt(a_d)
+	for doc, n := range numers {
+		bd := math.Sqrt(b_d[doc])
+		res = append(res, QueryResult{
+			Document: idx.LookupDoc[doc],
+			Score:    n / ad * bd,
+		})
+	}
+
+	sort.Sort(sort.Reverse(res))
+	return res
 }

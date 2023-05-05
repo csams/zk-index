@@ -10,8 +10,9 @@ import (
 // Term is a single term from a document.
 type Term string
 
-func Terms(f io.Reader) []Term {
-	scanner := bufio.NewScanner(f)
+// Terms parses the input into Terms using simple text splitting and a couple of rules specific to Telekasten.
+func Terms(input io.Reader) []Term {
+	scanner := bufio.NewScanner(input)
 	scanner.Split(bufio.ScanWords)
 
 	var terms []Term
