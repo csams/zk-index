@@ -59,10 +59,10 @@ func BuildCorpusStats(corpus Corpus) (CorpusStats, error) {
 		if err != nil {
 			return CorpusStats{}, err
 		}
-		defer f.Close()
 
 		id := DocId(ids)
 		docStats[id] = BuildTermFreqMap(f)
+		f.Close()
 
 		idMap[id] = doc
 		ids += 1
